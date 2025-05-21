@@ -1,6 +1,8 @@
 import tkinter as tk
 from tkinter import messagebox, filedialog, ttk
 import numpy as np
+import matplotlib
+
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import re
@@ -13,7 +15,132 @@ import multiprocessing as mp
 from epanettools import epanet2 as et
 from queue import Empty
 from scipy.optimize import differential_evolution
+import pandas as pd
+from datetime import datetime
+from io import BytesIO
+from docx.shared import Inches
+import epynet as ep
 
+matplotlib.use('TkAgg') 
+class OptimizadorHidraulico:
+    def __init__(self, network):
+        self.network = network
+        self.variables = {
+            'diametros': [('pipe-1', 0.1, 2.0), ('pipe-2', 0.2, 1.5)],
+            'tiempos_valvulas': [('valve-1', 1.0, 10.0)],
+            'rampas_bomba': [('pump-1', 1.0, 60.0)]
+        }
+        
+    def funcion_objetivo(self, x):
+        diam = {var[0]: x[i] for i, var in enumerate(self.variables['diametros'])}
+        t_valv = {var[0]: x[i] for i, var in enumerate(self.variables['tiempos_valvulas'])}
+        t_rampa = {var[0]: x[i] for i, var in enumerate(self.variables['rampas_bomba'])}
+        
+        for pipe_id, value in diam.items():
+            self.network.get_link(pipe_id).diameter = value
+            
+        resultados = self.simular_red(t_valv, t_rampa)
+        
+        return [
+            resultados['costo_total'], 
+            resultados['max_presion'], 
+            resultados['energia']
+        ]
+        
+    def optimizar_nsga2(self):
+        problem = ProblemaHidraulico(self.network, self.variables)
+        algorithm = NSGA2(pop_size=100)
+        res = minimize(problem, algorithm, ('n_gen', 200))
+        
+        pd.DataFrame(res.X).to_csv('pareto_solutions.csv')
+        self.graficar_frontes(res.F)
+        
+        return res
+    
+class WaterHammerAnalyzer:
+    def __init__(self, inp_file):
+        self.network = ep.Network(inp_file)
+        self.critical_nodes = []
+        self.pipes_data = {}
+
+    def load_pipe_parameters(self):
+        for pipe in self.network.pipes:
+            self.pipes_data[pipe.uid] = {
+                'L': pipe.length,
+                'D': pipe.diameter,
+                'v0': pipe.velocity,
+                'start_node': pipe.from_node.uid,
+                'end_node': pipe.to_node.uid
+            }
+
+    def identify_critical_nodes(self):
+        slopes = []
+        for pipe in self.network.pipes:
+            start_node = pipe.from_node  
+            end_node = pipe.to_node      
+            slope = abs(start_node.elevation - end_node.elevation)/pipe.length
+            slopes.append((pipe.uid, slope))
+        
+        self.critical_nodes = sorted(slopes, key=lambda x: x[1], reverse=True)[:3]
+        return self.critical_nodes
+
+    def joukowsky_pressure(self, delta_v):
+        c = 1200  
+        rho = 1000  
+        return rho * c * delta_v
+
+    def run_analysis(self, valve_close_time):
+        results = {}
+        for pipe_id, data in self.pipes_data.items():
+            t, Hup, Hdown, Q = metodo_caracteristicas_avanzado(
+                rho=1000, 
+                c=1200,
+                L=data['L'],
+                D=data['D'],
+                v_inicial=data['v0'],
+                t_cierre_valvula=valve_close_time
+            )
+            
+            rho = 1000 
+            g = 9.81 
+            presion_down = [h * rho * g for h in Hdown]
+            
+            results[pipe_id] = {
+                'data': (t, presion_down),
+                'params': data
+            }
+        return results
+
+def modelo_inercial_rigido(
+    rho, L, D, v_inicial, t_cierre_valvula, 
+    t_total=5.0, dt=0.01, P_inicial=300000
+):
+    g = 9.81
+    A = np.pi * (D**2) / 4
+    Q0 = v_inicial * A
+    f = 0.02  # Factor de fricción
+    
+    nsteps = int(t_total/dt) + 1
+    t = np.linspace(0, t_total, nsteps)
+    
+    Q = np.zeros(nsteps)
+    P = np.zeros(nsteps)
+    
+    Q[0] = Q0
+    P[0] = P_inicial 
+    
+    for i in range(1, nsteps):
+        if t[i] < t_cierre_valvula:
+            factor = 1 - t[i]/t_cierre_valvula
+        else:
+            factor = 0.0
+        
+        dQdt = (factor * P_inicial - (f * L/(2*D) * rho * Q[i-1]**2)/A**2) / (rho * L/A)
+        
+        Q[i] = Q[i-1] + dQdt * dt
+        P[i] = factor * P_inicial - (f * L/(2*D) * rho * Q[i]**2)/A**2
+        
+    return t, P/1000, Q
 
 def metodo_caracteristicas_simple(rho, c, L, D, v_inicial=1.0, t_cierre_valvula=1.0, escenario="sin_bomba", flujo_bomba=None, presion_bomba=None, t_total=5.0, dt=0.01, H_up=30.0, H_down=25.0):
 
@@ -71,13 +198,19 @@ def metodo_caracteristicas_simple(rho, c, L, D, v_inicial=1.0, t_cierre_valvula=
 
 
 class BombaCentrifuga:
-    def __init__(self, H0, Q0, potencia, inercia=100.0):
+    def __init__(self, node_id, H0, Q0, potencia, inercia=100.0):
         self.H0 = H0  
         self.Q0 = Q0 
         self.potencia = potencia  
         self.inercia = inercia  
         self.vel_angular = 0.0  
         self.estado = False 
+        self.node_id = node_id  
+        self.curva_qh = lambda Q: H0 - 0.2*H0*(Q/Q0)**2  
+        self.estado = "detenida"
+        self.vel_angular = 0.0
+        self.tiempo_arranque = 5.0  
+        self.tiempo_parada = 3.0
         
     def arrancar(self, dt):
         if not self.estado:
@@ -97,21 +230,38 @@ class BombaCentrifuga:
     def curva_caracteristica(self, Q):
         return self.H0 - 0.2*self.H0*(Q/self.Q0)**2  
 
+    def actualizar_estado(self, t, flujo_actual):
+        if self.estado == "arrancando":
+            self.vel_angular += (1500 - self.vel_angular)/self.tiempo_arranque
+            if self.vel_angular >= 1450:
+                self.estado = "operativa"
+                
+        elif self.estado == "parando":
+            self.vel_angular -= self.vel_angular/self.tiempo_parada
+            if self.vel_angular <= 50:
+                self.estado = "detenida"
+                
+        return self.curva_qh(flujo_actual) * (self.vel_angular/1500)
+    
 
 class ValvulaNoRetorno:
-    def __init__(self, tiempo_cierre=1.0, umbral_flujo=0.01):
-        self.tiempo_cierre = tiempo_cierre 
-        self.umbral = umbral_flujo 
-        self.abierta = True
+    def __init__(self, node_id, tiempo_cierre=1.0):
+        self.node_id = node_id
+        self.factor_apertura = 1.0
+        self.tiempo_cierre = tiempo_cierre
+        self.estado = "abierta"
         
-    def actualizar_estado(self, flujo, dt):
-        if self.abierta and flujo < -self.umbral: 
-            self.tiempo_actual = 0.0
-            self.abierta = False
-        elif not self.abierta:
-            self.tiempo_actual += dt
-            if self.tiempo_actual >= self.tiempo_cierre:
-                self.abierta = True
+    def actualizar(self, flujo, dt):
+        if flujo < 0 and self.estado == "abierta":
+            self.estado = "cerrando"
+            self.tiempo_transcurrido = 0.0
+            
+        if self.estado == "cerrando":
+            self.tiempo_transcurrido += dt
+            self.factor_apertura = 1 - (self.tiempo_transcurrido/self.tiempo_cierre)
+            if self.tiempo_transcurrido >= self.tiempo_cierre:
+                self.estado = "cerrada"
+                self.factor_apertura = 0.0
                 
     def factor_apertura(self):
         return 1.0 if self.abierta else 0.0
@@ -164,9 +314,7 @@ def simular_red_epanet(archivo_inp, duracion=3600):
         
 class ProblemaHidraulico(Problem):
     def __init__(self, red_epanet):
-        super().__init__(n_var=3, n_obj=2, n_constr=1,
-                         xl=np.array([0.1, 0.5, 1.0]),
-                         xu=np.array([2.0, 5.0, 10.0]))
+        super().__init__(n_var=3, n_obj=2, n_constr=1, xl=np.array([0.1, 0.5, 1.0]), xu=np.array([2.0, 5.0, 10.0]))
         self.red = red_epanet
         
     def _evaluate(self, X, out, *args, **kwargs):
@@ -213,8 +361,7 @@ def leer_epanet_principal(filename):
         'c': 1200.0,
         'L': 100.0,
         'D': 0.5,
-        'H_up': 30.0,
-        'H_down': 25.0
+        'P_inicial': 300
     }
     
     with open(filename, 'r', encoding='utf-8') as f:
@@ -225,7 +372,6 @@ def leer_epanet_principal(filename):
                     params['rho'] = float(match.group(1))
                 if match := re.search(r'c\s*=\s*([\d\.]+)', line, re.IGNORECASE):
                     params['c'] = float(match.group(1))
-
     
     try:
         err = et.ENopen(filename, "report.txt", "")
@@ -261,14 +407,20 @@ def leer_epanet_principal(filename):
 def metodo_caracteristicas_avanzado(rho, c, L, D,
                                     v_inicial=1.0,
                                     t_cierre_valvula=1.0,
-                                    t_pump_start=1.0, t_pump_stop=2.0,
+                                    t_pump_start=1.0, 
+                                    t_pump_stop=2.0,
                                     scenario="sin_bomba",
                                     flujo_bomba=None,
                                     presion_bomba=None,
                                     t_total=5.0,
                                     dt=0.01,
-                                    H_up=30.0,
-                                    H_down=25.0):
+                                    P_inicial=300000,  
+                                    bombas=[], 
+                                    valvulas=[]):
+    
+    g = 9.81
+    H0 = P_inicial / (rho * g)
+    
     A = np.pi*(D**2)/4.0
     nsteps = int(t_total/dt) + 1
     t_array = np.linspace(0, t_total, nsteps)
@@ -277,29 +429,36 @@ def metodo_caracteristicas_avanzado(rho, c, L, D,
     Hdown = np.zeros(nsteps)
     Qline = np.zeros(nsteps)
     
-    Hup[0] = H_up
-    Hdown[0] = H_down
+    Hup[0] = H0
+    Hdown[0] = H0
     Qline[0] = v_inicial * A
 
-    g = 9.81
     f = 0.02
     Beta = f * L / (2*g*D)
     alpha = c/(g*A)
 
     for n in range(1, nsteps):
+
         t_now = t_array[n]
         Q_old = Qline[n-1]
-        
+
+        for bomba in bombas:
+            H_bomba = bomba.actualizar_estado(t_now, Q_old)
+            Hup[n] += H_bomba
+
         if scenario in ["sin_bomba", "cierre_valvula"]:
+
             if scenario == "sin_bomba":
                 valve_factor = 1.0 - (t_now/t_cierre_valvula) if t_now < t_cierre_valvula else 0.0
+
             else:
                 valve_factor = 1.0 if t_now < t_cierre_valvula else 0.0
-            Hup[n] = H_up 
+            Hup[n] = H0
             c_plus = Hup[n] - Beta * Q_old * abs(Q_old) + alpha * Q_old
             c_minus = Hdown[n-1] + Beta * Q_old * abs(Q_old) - alpha * Q_old
             Qc = (c_plus - c_minus) / (2*Beta + 1e-12)
             Q_new = valve_factor * Qc
+
         elif scenario == "con_bomba":
             if t_now < t_pump_start:
                 pump_factor = 0.0
@@ -308,20 +467,28 @@ def metodo_caracteristicas_avanzado(rho, c, L, D,
             else:
                 pump_factor = 1.0
             pump_head = pump_factor * (presion_bomba/(rho*g)) if presion_bomba is not None else 0.0
-            Hup[n] = H_up + pump_head
+            Hup[n] = H0 + pump_head
             c_plus = Hup[n] - Beta * Q_old * abs(Q_old) + alpha * Q_old
             c_minus = Hdown[n-1] + Beta * Q_old * abs(Q_old) - alpha * Q_old
             Q_new = (c_plus - c_minus) / (2*Beta + 1e-12)
         else:
-            Hup[n] = H_up
+            Hup[n] = H0
             c_plus = Hup[n] - Beta * Q_old * abs(Q_old) + alpha * Q_old
             c_minus = Hdown[n-1] + Beta * Q_old * abs(Q_old) - alpha * Q_old
             Q_new = (c_plus - c_minus) / (2*Beta + 1e-12)
 
-        Qline[n] = Q_new
-        Hdown[n] = c_minus + alpha * Q_new - Beta * Q_new * abs(Q_new)
+        for valvula in valvulas:
+            valvula.actualizar(Q_old, dt)
+            factor = valvula.factor_apertura
+            Q_new *= factor
 
-    return t_array, Hup, Hdown
+            Hup[n] = H0
+
+    Pup = np.array(Hup) * rho * g
+    Pdown = np.array(Hdown) * rho * g
+
+    return t_array, Pup, Pdown, Qline
+
 
 class AppGolpeAriete(tk.Tk):
     def __init__(self):
@@ -334,6 +501,7 @@ class AppGolpeAriete(tk.Tk):
         self.simulation_thread = None  
         self.simulation_process = None
         self.queue = mp.Queue()
+        self.water_hammer_analyzer = None
 
         self.parametros = {
             'rho': {"label": "Densidad (kg/m³):", "entry": None},
@@ -343,7 +511,8 @@ class AppGolpeAriete(tk.Tk):
             'v_inicial': {"label": "Vel. inicial (m/s):", "entry": None},
             'tiempo_cierre_valvula': {"label": "Tiempo cierre válvula (s):", "entry": None},
             't_total': {"label": "Tiempo total sim (s):", "entry": None},
-            'dt': {"label": "Paso de tiempo dt (s):", "entry": None}
+            'dt': {"label": "Paso de tiempo dt (s):", "entry": None},
+            'P_inicial': {"label": "Presión inicial (kPa):", "entry": None}
         }
 
         self.flujo_bomba = None
@@ -354,8 +523,7 @@ class AppGolpeAriete(tk.Tk):
         self.crear_interfaz()
         self.graph_counter = 0
 
-        self.H_up = 30.0
-        self.H_down = 25.0
+        self.P_inicial = 300
 
         self.bombas = []
         self.valvulas = []
@@ -369,6 +537,9 @@ class AppGolpeAriete(tk.Tk):
         if not archivo:
             return
 
+        self.water_hammer_analyzer = WaterHammerAnalyzer(archivo)
+        self.water_hammer_analyzer.identify_critical_nodes()
+
         self.mostrar_progreso()
         self.simulation_process = mp.Process(
             target=worker_simulacion,
@@ -377,6 +548,8 @@ class AppGolpeAriete(tk.Tk):
         )
         self.simulation_process.start()
         self.verificar_estado_proceso()
+
+        self.dibujar_red_epanet()
 
     def ejecutar_simulacion_epanet(self, archivo, queue):
         try:
@@ -405,7 +578,6 @@ class AppGolpeAriete(tk.Tk):
                 self.after(100, self.verificar_estado_proceso)
             else:
                 self.ocultar_progreso()
-
 
     def actualizar_parametros(self, data):
         if 'error' in data:
@@ -486,6 +658,9 @@ class AppGolpeAriete(tk.Tk):
         self.mostrar_grafico(fig)
 
     def optimizacion_avanzada(self):
+        optimizador = OptimizadorHidraulico(self.water_hammer_analyzer.network)
+        resultados = optimizador.optimizar_nsga2()
+        self.mostrar_resultados_optimizacion(resultados)
         try:
             datos_red = {
                 'L': float(self.parametros["L"]["entry"].get()),
@@ -508,6 +683,33 @@ class AppGolpeAriete(tk.Tk):
             
         except Exception as e:
             messagebox.showerror("Error", f"Error en optimización: {str(e)}")
+
+    def analizar_golpe_ariete(self):
+        if not self.water_hammer_analyzer:
+            messagebox.showerror("Error", "Cargar archivo .inp primero")
+            return
+            
+        close_time = float(self.parametros["tiempo_cierre_valvula"]["entry"].get())
+        results = self.water_hammer_analyzer.run_analysis(close_time)
+        
+        doc = Document()
+        doc.add_heading('Análisis de Golpe de Ariete', 0)
+        
+        for pipe_id, data in results.items():
+            doc.add_heading(f'Tubería {pipe_id}', level=1)
+            doc.add_paragraph(f"Sobrepresión Simulada: {data['simulated']/1e6:.2f} MPa")
+            doc.add_paragraph(f"Joukowsky: {data['joukowsky']/1e6:.2f} MPa")
+            doc.add_paragraph(f"Relación Sim/Jouk: {data['simulated']/data['joukowsky']:.2f}")
+            
+            fig = plt.figure()
+            plt.plot(data['data'][0], data['data'][1])
+            plt.title(f"Presión en Tubería {pipe_id}")
+            img_stream = BytesIO()
+            fig.savefig(img_stream)
+            doc.add_picture(img_stream, width=Inches(5))
+            
+        doc.save("Informe_Golpe_Ariete.docx")
+        messagebox.showinfo("Listo", "Reporte generado en Informe_Golpe_Ariete.docx")
 
     def cargar_caso_peruano(self):
         datos = {
@@ -557,10 +759,12 @@ class AppGolpeAriete(tk.Tk):
         rb1 = tk.Radiobutton(frame, text="Base (Sin Bomba)", variable=self.scenario, value="sin_bomba", bg="#ffffff")
         rb2 = tk.Radiobutton(frame, text="Con Bomba (Arranque/Parada)", variable=self.scenario, value="con_bomba", bg="#ffffff")
         rb3 = tk.Radiobutton(frame, text="Cierre Repentino Válvula", variable=self.scenario, value="cierre_valvula", bg="#ffffff")
+        rb4 = tk.Radiobutton(frame, text="Modelo Inercial Rígido", variable=self.scenario, value="rigido", bg="#ffffff")
         rb1.grid(row=row_index, column=1, padx=10, pady=2, sticky="w")
         rb2.grid(row=row_index+1, column=1, padx=10, pady=2, sticky="w")
         rb3.grid(row=row_index+2, column=1, padx=10, pady=2, sticky="w")
-        row_index += 3
+        rb4.grid(row=row_index+3, column=1, padx=10, pady=2, sticky="w")
+        row_index += 4
 
         button_cargar = tk.Button(
             frame, text="Cargar archivo EPANET", command=self.cargar_archivo,
@@ -612,17 +816,11 @@ class AppGolpeAriete(tk.Tk):
         )
         button_caso_peru.place(relx=0.85, rely=0.1, anchor="center")
 
-        self.resultados_label = tk.Label(
-            self, text="RESULTADOS", font=("Arial", 14, "bold"),
-            bg="#ffffff", fg="#00796b"
-        )
-        self.resultados_label.place(relx=0.75, rely=0.1, anchor="e")
-
         self.canvas_frame = tk.Frame(self)
         self.canvas_frame.place(relx=0.7, rely=0.5, anchor="center")
 
-        self.canvas = tk.Canvas(self.canvas_frame, bg="white", width=800, height=600,
-                                scrollregion=(5200, 1200, 5200, 2000))
+        self.canvas = tk.Canvas(self.canvas_frame, bg="white", width=800, height=600, scrollregion=(0, 0, 5000, 5000))
+
         self.scrollbar = tk.Scrollbar(self.canvas_frame, orient="vertical", command=self.canvas.yview)
         self.scrollbar.pack(side="right", fill="y")
         self.canvas.config(yscrollcommand=self.scrollbar.set)
@@ -678,56 +876,217 @@ class AppGolpeAriete(tk.Tk):
                 "Por favor, ingresa valores numéricos válidos para la bomba."
             )
 
+    def mostrar_resultados_por_tuberia(self, results):
+        ventana_resultados = tk.Toplevel(self)
+        ventana_resultados.title("Resultados por Tubería")
+        ventana_resultados.geometry("1200x800")
+        
+        notebook = ttk.Notebook(ventana_resultados)
+        notebook.pack(fill='both', expand=True)
+
+        for pipe_id, data in results.items():
+            frame = tk.Frame(notebook)
+            notebook.add(frame, text=f"Tubería {pipe_id}")
+            
+            fig = plt.figure(figsize=(10, 6))
+            ax = fig.add_subplot(111)
+            ax.plot(data['data'][0], data['data'][1])
+            ax.set_title(f"Presión en {pipe_id}")
+            ax.set_xlabel('Tiempo (s)')
+            ax.set_ylabel('Altura Piezométrica (m)')
+            
+            canvas = FigureCanvasTkAgg(fig, frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill='both', expand=True)
+            
+            params_text = f"Longitud: {data['params']['L']:.2f} m\nDiámetro: {data['params']['D']:.2f} m\nVelocidad inicial: {data['params']['v0']:.2f} m/s"
+            label_params = tk.Label(frame, text=params_text, justify='left')
+            label_params.pack()
+
+    def editar_parametros_tuberia(self, pipe_id):
+        data = self.water_hammer_analyzer.pipes_data[pipe_id]
+        
+        ventana_edicion = tk.Toplevel(self)
+        ventana_edicion.title(f"Editar {pipe_id}")
+        
+        entries = {}
+        for i, (key, value) in enumerate(data.items()):
+            if key in ['L', 'D', 'v0']:
+                tk.Label(ventana_edicion, text=key).grid(row=i, column=0)
+                entries[key] = tk.Entry(ventana_edicion)
+                entries[key].insert(0, str(value))
+                entries[key].grid(row=i, column=1)
+        
+        tk.Button(ventana_edicion, text="Guardar", 
+                command=lambda: self.guardar_cambios(pipe_id, entries)).grid(row=len(entries)+1, columnspan=2)
+
+    def guardar_cambios(self, pipe_id, entries):
+        new_data = {
+            'L': float(entries['L'].get()),
+            'D': float(entries['D'].get()),
+            'v0': float(entries['v0'].get())
+        }
+        self.water_hammer_analyzer.pipes_data[pipe_id].update(new_data)
+        messagebox.showinfo("Éxito", "Parámetros actualizados")
+
 
     def calcular(self):
-        try:
-            rho = float(self.parametros["rho"]["entry"].get())
-            c = float(self.parametros["c"]["entry"].get())
-            L = float(self.parametros["L"]["entry"].get())
-            D = float(self.parametros["D"]["entry"].get())
-            v_inicial = float(self.parametros["v_inicial"]["entry"].get())
-            t_cierre = float(self.parametros["tiempo_cierre_valvula"]["entry"].get())
-            t_total = float(self.parametros["t_total"]["entry"].get()) if self.parametros["t_total"]["entry"].get() else 5.0
-            dt = float(self.parametros["dt"]["entry"].get()) if self.parametros["dt"]["entry"].get() else 0.01
+        rho = float(self.parametros["rho"]["entry"].get())
+        c = float(self.parametros["c"]["entry"].get())
+        L = float(self.parametros["L"]["entry"].get())
+        D = float(self.parametros["D"]["entry"].get())
+        v_inicial = float(self.parametros["v_inicial"]["entry"].get())
+        t_cierre = float(self.parametros["tiempo_cierre_valvula"]["entry"].get())
+        t_total = float(self.parametros["t_total"]["entry"].get()) if self.parametros["t_total"]["entry"].get() else 5.0
+        dt = float(self.parametros["dt"]["entry"].get()) if self.parametros["dt"]["entry"].get() else 0.01
 
-            escenario = self.scenario.get()
-            t_pump_start = 1.0
-            t_pump_stop = 2.0
+        escenario = self.scenario.get()
+        t_pump_start = 1.0
+        t_pump_stop = 2.0
 
-            t1, hup1, hdown1 = metodo_caracteristicas_avanzado(
+        if escenario == "rigido":
+            t, P, Q = modelo_inercial_rigido(
+                rho=rho,
+                L=L,
+                D=D,
+                v_inicial=v_inicial,
+                t_cierre_valvula=t_cierre,
+                t_total=t_total,
+                dt=dt,
+                P_inicial=self.P_inicial * 1000
+            )
+            
+            Qline = Q
+            t1 = t
+            Pup1 = P
+            Pdown1 = P 
+
+        else:
+            t1, Pup1, Pdown1, Qline = metodo_caracteristicas_avanzado(
                 rho, c, L, D,
                 v_inicial=v_inicial,
                 t_cierre_valvula=t_cierre,
-                t_pump_start=t_pump_start, t_pump_stop=t_pump_stop,
+                t_pump_start=t_pump_start, 
+                t_pump_stop=t_pump_stop,
                 scenario=escenario,
                 flujo_bomba=self.flujo_bomba,
                 presion_bomba=self.presion_bomba,
                 t_total=t_total,
                 dt=dt,
-                H_up=self.H_up,
-                H_down=self.H_down
+                P_inicial=self.P_inicial * 1000  
             )
 
-            for widget in self.graph_frame.winfo_children():
-                widget.destroy()
-            fig1, ax1 = plt.subplots(figsize=(6,4))
-            ax1.plot(t1, hup1, label="Upstream")
-            ax1.plot(t1, hdown1, label="Downstream")
-            ax1.set_title(f"Escenario: {escenario}")
-            ax1.set_xlabel("Tiempo (s)")
-            ax1.set_ylabel("Altura (m)")
-            ax1.legend()
-            ax1.grid(True)
-            canvas1 = FigureCanvasTkAgg(fig1, self.graph_frame)
-            canvas1.draw()
-            canvas1.get_tk_widget().pack(pady=10, padx=10)
-            self.canvas.config(scrollregion=self.canvas.bbox("all"))
-            messagebox.showinfo("Resultado", 
-                                "Simulación completada con éxito.\nRevisa los gráficos para ver los resultados.")
-        except ValueError:
-            messagebox.showerror("Error", "Por favor, ingresa valores numéricos válidos.")
-        except Exception as e:
-            messagebox.showerror("Error", f"Ocurrió un error al calcular:\n{e}")
+        g = 9.81
+
+        for widget in self.graph_frame.winfo_children():
+            widget.destroy()
+
+        fig1, ax1 = plt.subplots(figsize=(8, 5))
+        
+        ax1.plot(t1, np.array(Pup1)/1000, label="Upstream", linewidth=2)
+        ax1.plot(t1, np.array(Pdown1)/1000, label="Downstream", linewidth=2)
+        ax1.set_ylabel('Presión (kPa)')
+        
+        ax1.set_title(f"Simulación Hidráulica - {escenario}", fontsize=14, weight='bold')
+        ax1.set_xlabel('Tiempo (s)', fontsize=12, labelpad=10)
+        ax1.set_ylabel('Altura Piezométrica (m)', fontsize=12, labelpad=10)
+        ax1.grid(True, linestyle='--', alpha=0.7)
+        ax1.legend(loc='upper right', frameon=True, shadow=True)
+        
+        textstr = '\n'.join((
+            f'ΔP máximo: {np.max(Pdown1)/1000 - self.P_inicial:.2f} kPa',
+            f'v₀: {v_inicial} m/s',
+            f'L: {L} m',
+            f'D: {D} m',
+            f'c: {c} m/s'))
+        ax1.text(0.95, 0.15, textstr, transform=ax1.transAxes,
+                fontsize=10, verticalalignment='top', 
+                horizontalalignment='right',
+                bbox=dict(boxstyle='round', 
+                        facecolor='white', 
+                        alpha=0.8,
+                        edgecolor='#00796b'))
+
+        canvas1 = FigureCanvasTkAgg(fig1, self.graph_frame)
+        canvas1.draw()
+        canvas1.get_tk_widget().pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
+
+        fig_tabla = self.generar_tabla_resultados(t1, Pup1, Pdown1, Qline)
+
+        canvas_tabla = FigureCanvasTkAgg(fig_tabla, self.graph_frame)
+        canvas_tabla.draw()
+        canvas_tabla.get_tk_widget().pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
+
+        ventana_resultados = tk.Toplevel(self)
+        ventana_resultados.title("Resultados de Simulación MOC")
+        ventana_resultados.geometry("1000x800")
+        
+        graph_container = tk.Frame(ventana_resultados)
+        graph_container.pack(fill=tk.BOTH, expand=True)
+        
+        canvas1 = FigureCanvasTkAgg(fig1, master=graph_container)
+        canvas1.draw()
+        canvas1.get_tk_widget().pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
+        
+        canvas_tabla = FigureCanvasTkAgg(fig_tabla, master=graph_container)
+        canvas_tabla.draw()
+        canvas_tabla.get_tk_widget().pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
+
+        if not hasattr(self, 'figures'):
+            self.figures = []
+        self.figures.extend([fig1, fig_tabla])
+
+        self.canvas.config(scrollregion=self.canvas.bbox("all"))
+        
+        messagebox.showinfo("Resultado", "Simulación completada con éxito.\nRevisa los gráficos y tablas para los resultados detallados.")
+        
+        if hasattr(self, 'figures'):
+            for fig in self.figures:
+                plt.close(fig)
+        self.figures = [fig1, fig_tabla]
+        
+        messagebox.showinfo("Resultado", "Gráficos generados en ventana emergente.")
+
+        self.water_hammer_analyzer.load_pipe_parameters()
+        close_time = float(self.parametros["tiempo_cierre_valvula"]["entry"].get())
+        results = self.water_hammer_analyzer.run_analysis(close_time)
+        self.mostrar_resultados_por_tuberia(results)
+
+    def generar_tabla_resultados(self, t, Hup, Hdown, Q):
+        df = pd.DataFrame({
+            'Tiempo (s)': t,
+            'Altura Upstream (m)': Hup,
+            'Altura Downstream (m)': Hdown,
+            'Caudal (m³/s)': Q
+        })
+        
+        stats = pd.DataFrame({
+            'Máximo': [df['Altura Upstream (m)'].max(), 
+                    df['Altura Downstream (m)'].max(), 
+                    df['Caudal (m³/s)'].max()],
+            'Mínimo': [df['Altura Upstream (m)'].min(), 
+                    df['Altura Downstream (m)'].min(), 
+                    df['Caudal (m³/s)'].min()],
+            'Promedio': [df['Altura Upstream (m)'].mean(), 
+                        df['Altura Downstream (m)'].mean(), 
+                        df['Caudal (m³/s)'].mean()]
+        }, index=['Upstream', 'Downstream', 'Caudal'])
+        
+        fig, ax = plt.subplots(figsize=(8, 3))
+        ax.axis('tight')
+        ax.axis('off')
+        tabla = ax.table(cellText=stats.values.round(2),
+                        colLabels=stats.columns,
+                        rowLabels=stats.index,
+                        cellLoc='center',
+                        loc='center',
+                        bbox=[0, 0, 1, 1])
+        
+        tabla.auto_set_font_size(False)
+        tabla.set_fontsize(10)
+        tabla.scale(1.2, 1.2)
+        
+        return fig
 
     def realizar_analisis(self):
         try:
@@ -737,7 +1096,8 @@ class AppGolpeAriete(tk.Tk):
             D = float(self.parametros["D"]["entry"].get())
             v_inicial = float(self.parametros["v_inicial"]["entry"].get())
             t_cierre = float(self.parametros["tiempo_cierre_valvula"]["entry"].get())
-            t_array, hup, hdown = metodo_caracteristicas_avanzado(
+            
+            t_array, hup, hdown, _ = metodo_caracteristicas_avanzado(
                 rho, c, L, D,
                 v_inicial=v_inicial,
                 t_cierre_valvula=t_cierre,
@@ -747,6 +1107,7 @@ class AppGolpeAriete(tk.Tk):
                 H_up=self.H_up,
                 H_down=self.H_down
             )
+            
             g = 9.81
             p_up = rho * g * hup  
             p_down = rho * g * hdown
@@ -755,40 +1116,71 @@ class AppGolpeAriete(tk.Tk):
             delta_p = max_p - base_p
             analisis = self.generar_analisis(delta_p, rho, c, L, D, v_inicial)
             self.mostrar_analisis(analisis)
+            
         except Exception as e:
             messagebox.showerror("Error", f"Ocurrió un error: {e}")
 
     def generar_analisis(self, delta_P, rho, c, L, D, v_inicial):
-        analisis = "Análisis del Golpe de Ariete (MOC Avanzado)\n"
-        analisis += "--------------------------------\n\n"
-        analisis += f"Densidad (rho): {rho} kg/m³\n"
-        analisis += f"Velocidad de onda (c): {c} m/s\n"
-        analisis += f"Longitud (L): {L} m\n"
-        analisis += f"Diámetro (D): {D} m\n"
-        analisis += f"Velocidad inicial (v_inicial): {v_inicial} m/s\n\n"
-        analisis += f"Sobrepresión máxima estimada (ΔP): {delta_P:.2f} Pa\n\n"
 
-        if delta_P > 1e6:
-            analisis += "El golpe de ariete es extremadamente alto. Riesgo de daños.\n"
-            analisis += "Recomendaciones:\n"
-            analisis += " - Amortiguadores de presión\n"
-            analisis += " - Válvulas de cierre lento\n"
-            analisis += " - Diseño reforzado de tuberías\n"
-        elif delta_P > 1e5:
-            analisis += "El golpe de ariete es significativo. Podrían darse daños moderados.\n"
-            analisis += "Recomendaciones:\n"
-            analisis += " - Válvulas de asiento\n"
-            analisis += " - Amortiguadores de presión\n"
-            analisis += " - Monitoreo frecuente\n"
+        analisis = ""
+
+        if self.scenario.get() == "rigido":
+            analisis += "**Modelo Utilizado**: Dinámico Inercial Rígido\n"
+            analisis += "- Considera inercia del fluido\n"
+            analisis += "- Ignora efectos elásticos y onda de presión\n"
+            analisis += "- Apropiado para eventos lentos (ej: arranque bombas)\n\n"
         else:
-            analisis += "El golpe de ariete es bajo. Bajo riesgo de daños inmediatos.\n"
-            analisis += "Recomendaciones:\n"
-            analisis += " - Monitoreo periódico\n"
-            analisis += " - Válvulas de amortiguamiento\n"
+            analisis += "**Modelo Utilizado**: Método de las Características (Elástico)\n\n"
 
-        analisis += "\nConclusión:\n"
-        analisis += "Este informe muestra la sobrepresión simulada utilizando un modelo avanzado que incluye efectos de arranque/parada de bomba y cierre repentino de válvula.\n"
-        analisis += "Para mayor exactitud, sería conveniente modelar una red completa con múltiples elementos.\n"
+        analisis = "Análisis Detallado del Golpe de Ariete\n"
+        analisis += "=====================================\n\n"
+        
+        analisis += "**Parámetros de Simulación:**\n"
+        analisis += f"- Densidad del fluido (ρ): {rho} kg/m³\n"
+        analisis += f"- Velocidad de onda de presión (c): {c} m/s\n"
+        analisis += f"- Longitud de tubería (L): {L} m\n"
+        analisis += f"- Diámetro interno (D): {D} m\n"
+        analisis += f"- Velocidad inicial del flujo (v₀): {v_inicial} m/s\n"
+        analisis += f"- Presión inicial: {self.P_inicial} kPa\n"
+        
+        A = np.pi*(D**2)/4
+        Q0 = v_inicial * A
+        tiempo_reflexion = 2*L/c
+        J = (c * v_inicial)/9.81
+        
+        J_presion = rho * c * v_inicial
+        analisis += f"- Sobrepresión teórica (Joukowsky): {J_presion/1000:.2f} kPa\n"
+
+        analisis += "**Cálculos Fundamentales:**\n"
+        analisis += f"- Área transversal de la tubería: {A:.4f} m²\n"
+        analisis += f"- Caudal inicial (Q₀): {Q0:.4f} m³/s\n"
+        analisis += f"- Tiempo de reflexión de onda: {tiempo_reflexion:.2f} s\n"
+        analisis += f"- Sobrepresión teórica (Joukowsky): {J:.2f} m\n\n"
+        
+        analisis += "**Resultados de la Simulacion:**\n"
+        analisis += f"- Sobrepresión máxima registrada: {delta_P/1000:.2f} kPa\n"
+        analisis += f"- Relación Joukowsky/Resultado: {(J*9.81*rho)/(delta_P):.2f}\n"
+        
+        analisis += "\n**Análisis Comparativo:**\n"
+        if abs((J*9.81*rho) - delta_P) < 0.1*delta_P:
+            analisis += "La sobrepresión se alinea con la teoría de Joukowsky (variación <10%)\n"
+        else:
+            analisis += "Se detectan discrepancias significativas respecto a la teoría base\n"
+        
+        analisis += "\n**Recomendaciones Técnicas:**\n"
+        if D < 0.3:
+            analisis += "- Considerar tuberías de mayor diámetro para reducir velocidades\n"
+        if c < 800:
+            analisis += "- Evaluar material de tubería (módulo de elasticidad)\n"
+        
+        analisis += "\n**Efectos del Escenario Simulado:**\n"
+        if self.scenario.get() == "con_bomba":
+            analisis += "- La operación de bombas introduce variaciones de presión cíclicas\n"
+            analisis += f"- Potencia de bomba: {self.presion_bomba} bar\n"
+            analisis += f"- Flujo de bomba: {self.flujo_bomba} m³/h\n"
+        elif self.scenario.get() == "cierre_valvula":
+            analisis += "- El cierre repentino genera ondas de presión de alta frecuencia\n"
+        
         return analisis
 
     def mostrar_analisis(self, analisis):
@@ -853,35 +1245,38 @@ class AppGolpeAriete(tk.Tk):
             "Se buscará la combinación (v_inicial, t_cierre) que minimice la sobrepresión máxima."
         )
         bounds = [(0.0, 5.0), (0.1, 5.0)]
-        try:
-            rho = float(self.parametros["rho"]["entry"].get())
-            c = float(self.parametros["c"]["entry"].get())
-            L = float(self.parametros["L"]["entry"].get())
-            D = float(self.parametros["D"]["entry"].get())
-        except:
-            messagebox.showerror(
-                "Error",
-                "Por favor ingresa parámetros válidos (rho, c, L, D) antes de optimizar."
-            )
-            return
+
+        rho = float(self.parametros["rho"]["entry"].get())
+        c = float(self.parametros["c"]["entry"].get())
+        L = float(self.parametros["L"]["entry"].get())
+        D = float(self.parametros["D"]["entry"].get())
+
         def objetivo(vars_):
-            v_ini = vars_[0]
-            t_cie = vars_[1]
-            t, hup, hdown = metodo_caracteristicas_avanzado(
-                rho, c, L, D,
-                v_inicial=v_ini,
-                t_cierre_valvula=t_cie,
-                scenario=self.scenario.get(),
-                H_up=self.H_up,
-                H_down=self.H_down,
-                t_total=5.0,
-                dt=0.01
-            )
-            g = 9.81
-            p_up = rho * g * hup
-            p_down = rho * g * hdown
-            max_p = max(np.max(p_up), np.max(p_down))
-            return max_p
+            if self.scenario.get() == "rigido":
+                t, P, Q = modelo_inercial_rigido(
+                    rho, L, D, vars_[0], vars_[1], 
+                    t_total=5.0, dt=0.01, P_inicial=self.P_inicial*1000
+                )
+                max_p = np.max(P)
+            else:
+                v_ini = vars_[0]
+                t_cie = vars_[1]
+                t, hup, hdown, _ = metodo_caracteristicas_avanzado(
+                    rho, c, L, D,
+                    v_inicial=v_ini,
+                    t_cierre_valvula=t_cie,
+                    scenario=self.scenario.get(),
+                    H_up=self.H_up,
+                    H_down=self.H_down,
+                    t_total=5.0,
+                    dt=0.01
+                )
+                g = 9.81
+                p_up = rho * g * hup
+                p_down = rho * g * hdown
+                max_p = max(np.max(p_up), np.max(p_down))
+                return max_p
+        
         result = differential_evolution(objetivo, bounds, maxiter=20, popsize=15, tol=1e-3)
         if result.success:
             v_opt_inicial, t_opt_cierre = result.x
@@ -896,6 +1291,57 @@ class AppGolpeAriete(tk.Tk):
                 "Optimización incompleta",
                 "El optimizador no convergió a una solución satisfactoria."
             )
+
+    def dibujar_red_epanet(self):
+        if not self.water_hammer_analyzer:
+            return
+            
+        self.canvas.delete("all")
+        network = self.water_hammer_analyzer.network
+        
+        coords = {}
+        for node in network.nodes:
+            coords[node.uid] = node.coordinates
+        
+        coords = {k: v for k, v in coords.items() if v is not None}
+        
+        if not coords:
+            messagebox.showerror("Error", "El archivo .inp no contiene coordenadas de nodos")
+            return
+        
+        x_vals = [v[0] for v in coords.values()]
+        y_vals = [v[1] for v in coords.values()]
+        min_x, max_x = min(x_vals), max(x_vals)
+        min_y, max_y = min(y_vals), max(y_vals)
+        
+        canvas_width = 800
+        canvas_height = 600
+        scale_x = canvas_width / (max_x - min_x) if (max_x - min_x) != 0 else 1
+        scale_y = canvas_height / (max_y - min_y) if (max_y - min_y) != 0 else 1
+        
+        for pipe in network.pipes:
+            start_node = pipe.from_node.uid
+            end_node = pipe.to_node.uid
+            if start_node in coords and end_node in coords:
+                x1 = (coords[start_node][0] - min_x) * scale_x
+                y1 = (coords[start_node][1] - min_y) * scale_y
+                x2 = (coords[end_node][0] - min_x) * scale_x
+                y2 = (coords[end_node][1] - min_y) * scale_y
+                self.canvas.create_line(x1, y1, x2, y2, fill="blue", width=2)
+        
+        for node_id, (x, y) in coords.items():
+            x_scaled = (x - min_x) * scale_x
+            y_scaled = (y - min_y) * scale_y
+            self.canvas.create_oval(
+                x_scaled-5, y_scaled-5, x_scaled+5, y_scaled+5,
+                fill="red", outline="black"
+            )
+            self.canvas.create_text(
+                x_scaled, y_scaled-10,
+                text=node_id, fill="green", font=("Arial", 8)
+            )
+        
+        self.canvas.config(scrollregion=self.canvas.bbox("all"))
 
 if __name__ == "__main__":
     app = AppGolpeAriete()
